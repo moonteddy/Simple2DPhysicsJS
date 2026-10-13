@@ -1,18 +1,39 @@
 
-class Physics{
+import { Vector } from './Vector.js';
+import { Simplex } from './Simplex.js';
+import { 
+	intersectAABB, removeFromArray, distance, normal, sub, scale,
+	lerpVector, length, isOnRight, rightVector, dot, invert,
+	equalTolerance, upVector, rotateVector, squaredDistance, getUV
+} from './Utils.js';
 
+export class Physics {
 	crosshairPosition = new Vector(400, 500);
 	origin = new Vector(0, 0);
 	intersectPair = [];
-    simplex = new Simplex();
+	simplex = new Simplex();
 
-	constructor(){
+	// collision response tuning (letter vs letter; walls use each body's bounciness)
+	collisionForceScale = 1;		// separation velocity = penetration depth * this
+	collisionTorqueScale = 0.5;		// spin from a polygon hit = penetration depth * this
+
+	// debug arrays
+	minkowskiDiffArr = [];
+	convexHullArr = [];
+	epaArr = [];
+	hitPointsArr = [];
+	hitLine = [];
+	dsitLineA = new Vector();
+	dsitLineB = new Vector();
+
+	constructor(collisionForceScale = 1, collisionTorqueScale = 0.5) {
+		this.collisionForceScale = collisionForceScale;
+		this.collisionTorqueScale = collisionTorqueScale;
 	}
 
-	tick(deltaTime){
-		
+	tick(deltaTime) {
 		// 1. All bodies move physically(location & rotation).
-		this.applayPhysicsAllBodies(deltaTime);
+		this.applyPhysicsAllBodies(deltaTime);
 		// 2. Rectangular collision check for all bodies.
 		this.checkBoundingBox(10);
 		// 3. Collect square Rectangular results.
@@ -26,13 +47,8 @@ class Physics{
 		this.intersectPair = [];
 	}
 
-	
-
-	debugGJK(bodyA, bodyB){
-		// minkoski convex hull..  for debug draw
-		// 0 ~ 360
+	debugGJK(bodyA, bodyB) {
 		var dir = [];
-
 		var startDir = upVector();
 		for (var i = 0; i < 35; i++) {
 			dir.push(rotateVector(startDir, i * 10));
@@ -42,37 +58,46 @@ class Physics{
 			var supportPoint = this.support2(bodyA.points, bodyB.points, dir[i]);
 			var pointHull = new Vector(supportPoint.x + this.crosshairPosition.x, supportPoint.y + this.crosshairPosition.y);
 
-			if (false == this.convexHullArr.includes(pointHull)) {
+			if (false === this.convexHullArr.includes(pointHull)) {
 				this.convexHullArr.push(pointHull);
 			}
 		}
 	}
 
-	applayPhysicsAllBodies(deltaTime){
-		// loop every bodies 
-		for (var i = 0; i < world.bodyArr.length; i++){
-			let body = world.bodyArr[i];
+	applyPhysicsAllBodies(deltaTime) {
+		const world = typeof window !== 'undefined' ? window.world : null;
+		if (!world) return;
 
+		for (var i = 0; i < world.bodyArr.length; i++) {
+			let body = world.bodyArr[i];
 			body.setBoundingBox();
+
+			if (body.collisionDelay > 0)
+				body.collisionDelay -= deltaTime;
 
 			if (body.queryOnly)
 				continue;
 			
-			body.applyGrivity(deltaTime);
-
+			body.applyGravity(deltaTime);
 			body.applyVelocityResist(deltaTime);
 			body.applyRotationResist(deltaTime);
 
 			body.updatePosition();
 			body.updateRotation();
 		}
-
 	}
 
+	// Backward compatibility alias
+	applayPhysicsAllBodies(deltaTime) {
+		this.applyPhysicsAllBodies(deltaTime);
+	}
 
-	// check every bodies
-	checkBoundingBox(padding = 0){
-		// add padding
+	// Optimized Broadphase O(N(N-1)/2)
+	checkBoundingBox(padding = 0) {
+		const world = typeof window !== 'undefined' ? window.world : null;
+		if (!world) return;
+
+		// Expand bounding box with padding
 		for (var i = 0; i < world.bodyArr.length; i++) {
 			world.bodyArr[i].boundingBox.minX -= padding;
 			world.bodyArr[i].boundingBox.minY -= padding;
@@ -80,58 +105,60 @@ class Physics{
 			world.bodyArr[i].boundingBox.maxY += padding;
 		}
 		
-		for (var i = 0; i < world.bodyArr.length; i++) {
-			for (var j = 0; j < world.bodyArr.length; j++) {
-				// ignore same body
-				if (world.bodyArr[i] == world.bodyArr[j]) {
+		for (let i = 0; i < world.bodyArr.length; i++) {
+			const bodyA = world.bodyArr[i];
+			for (let j = i + 1; j < world.bodyArr.length; j++) {
+				const bodyB = world.bodyArr[j];
+
+				// ignore if both are static walls
+				if (bodyA.queryOnly && bodyB.queryOnly) {
 					continue;
 				}
-				// ignore world wall
-				if (world.bodyArr[i].queryOnly && world.bodyArr[j].queryOnly) {
+
+				// bodies in collisionDelay only collide with static ones
+				if (!bodyA.queryOnly && !bodyB.queryOnly && (bodyA.collisionDelay > 0 || bodyB.collisionDelay > 0)) {
 					continue;
 				}
 
 				// check each body's intersect
-				var isIntersect = intersectAABB(world.bodyArr[i].boundingBox, world.bodyArr[j].boundingBox);
+				const isIntersect = intersectAABB(bodyA.boundingBox, bodyB.boundingBox);
 
 				if (isIntersect) {
-					// notify to body
-					if (false == world.bodyArr[j].intersectBody.includes(world.bodyArr[i])) {
-						world.bodyArr[j].onBoundingBoxEnter(world.bodyArr[i]);
+					if (!bodyB.intersectBody.includes(bodyA)) {
+						bodyB.onBoundingBoxEnter(bodyA);
 					}
-
-					if (false == world.bodyArr[i].intersectBody.includes(world.bodyArr[j])) {
-						world.bodyArr[i].onBoundingBoxEnter(world.bodyArr[j]);
+					if (!bodyA.intersectBody.includes(bodyB)) {
+						bodyA.onBoundingBoxEnter(bodyB);
 					}
-				}else{
-					// notify to body
-					if (world.bodyArr[i].intersectBody.includes(world.bodyArr[j])) {
-						world.bodyArr[i].onBoundingBoxExit(world.bodyArr[j]);
+				} else {
+					if (bodyA.intersectBody.includes(bodyB)) {
+						bodyA.onBoundingBoxExit(bodyB);
 					}
-
-					if (world.bodyArr[j].intersectBody.includes(world.bodyArr[i])) {
-						world.bodyArr[j].onBoundingBoxExit(world.bodyArr[i]);
+					if (bodyB.intersectBody.includes(bodyA)) {
+						bodyB.onBoundingBoxExit(bodyA);
 					}
 				}
 			}
 		}
-
 	}
 
+	collectCollisions() {
+		const world = typeof window !== 'undefined' ? window.world : null;
+		if (!world) return;
 
-	collectCollisions(){
 		for (var i = 0; i < world.bodyArr.length; i++) {
 			let bodyA = world.bodyArr[i];
-			for (var j = 0; j < bodyA.intersectBody.length; j++) {
-				let bodyB = bodyA.intersectBody[j];
+
+			// pop instead of indexing: entries are removed while collecting
+			while (bodyA.intersectBody.length > 0) {
+				let bodyB = bodyA.intersectBody.pop();
+				removeFromArray(bodyB.intersectBody, bodyA);
 
 				// ignore world wall
 				if (bodyA.queryOnly && bodyB.queryOnly)
 					continue;
 
 				this.intersectPair.push([bodyA, bodyB]);
-				removeFromArray(bodyB.intersectBody, bodyA);
-				removeFromArray(bodyA.intersectBody, bodyB);
 			}
 		}
 	}
@@ -165,50 +192,35 @@ class Physics{
 		let force = normal(sub(bodyA.position, bodyB.position));
 		force = scale(force, impactSize);
 
-		if (false == bodyA.queryOnly) {
-			bodyA.addForce(force);
-		}
+		this.separate(bodyA, bodyB, force);
 
-		if (false == bodyB.queryOnly) {
-			bodyB.addForce(scale(force, -1));
-		}
-
-	}	
+	}
 
 
 	collisionSolvePolygonCircle(bodyA, bodyB){
-		let hitOnEdge;
-		let circleCenter;
-		let radius;
+		let circle = bodyA.isCircle ? bodyA : bodyB;
+		let polygon = bodyA.isCircle ? bodyB : bodyA;
 
-		if (bodyA.isCircle) {
-			hitOnEdge = this.simplex.getHitPoint(bodyB, bodyA);
-			circleCenter = bodyA.position;
-			radius = bodyA.radius;
-		}else{
-			hitOnEdge = this.simplex.getHitPoint(bodyA, bodyB);
-			circleCenter = bodyB.position;
-			radius = bodyB.radius;
-		}
+		let hitOnEdge = this.simplex.getHitPoint(polygon, circle);
 
+        let dist = distance(hitOnEdge, circle.position);
 
-        let dist = distance(hitOnEdge, circleCenter);
+		// circle center went inside the polygon : push out through the nearest edge
+		let isCenterInside = polygon.isInside(circle.position);
 
-		let impactSize = radius - dist;
+		let impactSize = isCenterInside ? circle.radius + dist : circle.radius - dist;
 
 		if (impactSize < 0)
 			return;
 
-		let force = normal(sub(hitOnEdge, circleCenter));
+		// pushes the circle away from the polygon
+		let force = normal(sub(circle.position, hitOnEdge));
+		if (isCenterInside) {
+			force = invert(force);
+		}
 		force = scale(force, impactSize);
 
-		if (false == bodyA.queryOnly) {
-			bodyA.addForce(force);
-		}
-
-		if (false == bodyB.queryOnly) {
-			bodyB.addForce(scale(force, -1));
-		}
+		this.separate(circle, polygon, force);
 	}
 
 
@@ -223,51 +235,92 @@ class Physics{
 			// EPA
 			let epaResult = this.epa(bodyA, bodyB, gjkResult.vertices);
 
+			if (!epaResult || epaResult.edge.length < 3)
+				return;
+
+
+			let force =	epaResult.closestNormal;
+
+			this.separate(bodyA, bodyB, scale(force, -1));
+
 
 			let contributeResult = this.getContributePoints(bodyA, bodyB, [epaResult.edge[0], epaResult.edge[1]]);
 
 			let contributeA = contributeResult.A; // array
 			let contributeB = contributeResult.B; // array
 
+			// hit points can't be restored from the EPA edge, so skip torque
+			if (contributeA.length < 2 || contributeB.length < 2)
+				return;
+
 			let hitPointA = lerpVector(contributeA[0], contributeA[1], epaResult.edge[2]);
 			let hitPointB = lerpVector(contributeB[0], contributeB[1], epaResult.edge[2]);
 
+			let torque = length(force) * this.collisionTorqueScale;
 
-			let force =	epaResult.closestNormal;
-			let torque = length(force) * 0.5;
 
-			
 			if (false == bodyA.queryOnly) {
-				bodyA.addForce( scale(force, -1) );
+				let torqueA = torque;
 
 				let dirHitAtoCenterA = sub(bodyA.position, hitPointA);
 				let dirHitAtoHitB = sub(hitPointB, hitPointA);			// penetarte
 
 
 				if (isOnRight(dirHitAtoHitB, dirHitAtoCenterA)) {
-					torque *= -1;
+					torqueA *= -1;
 				}
 
-				bodyA.addTorque(torque);
+				bodyA.addTorque(torqueA);
 
 			}
 
 
 			if (false == bodyB.queryOnly) {
-				bodyB.addForce(force);
+				let torqueB = torque;
 
 				let dirHitBtoCenterB = sub(bodyB.position, hitPointB);
 				let dirHitBtoHitA = sub(hitPointA, hitPointB);			// penetarte
-				
+
 				if (false == isOnRight(dirHitBtoCenterB, dirHitBtoHitA)) {
-					torque *= -1;
+					torqueB *= -1;
 				}
 
-				bodyB.addTorque(torque);
-			}		
+				bodyB.addTorque(torqueB);
+			}
 		}
 	}
 
+
+
+	// pushA : separation vector for bodyA, bodyB gets the opposite one
+	separate(bodyA, bodyB, pushA){
+		if (bodyB.queryOnly && false == bodyA.queryOnly) {
+			this.resolveStatic(bodyA, pushA);
+		} else if (bodyA.queryOnly && false == bodyB.queryOnly) {
+			this.resolveStatic(bodyB, scale(pushA, -1));
+		} else {
+			if (false == bodyA.queryOnly) {
+				bodyA.addForce(scale(pushA, this.collisionForceScale));
+			}
+
+			if (false == bodyB.queryOnly) {
+				bodyB.addForce(scale(pushA, -this.collisionForceScale));
+			}
+		}
+	}
+
+	// Against a static (queryOnly) body : move out of it and bounce only the velocity going into it,
+	// so the body keeps sliding along it instead of having its whole velocity replaced.
+	resolveStatic(body, push){
+		body.addPosition(push);
+
+		let n = normal(push);
+		let into = dot(body.velocity, n);
+
+		if (into < 0) {
+			body.addForce(sub(body.velocity, scale(n, into * (1 + body.bounciness))));
+		}
+	}
 
 
 	gjk(bodyA, bodyB){
@@ -422,15 +475,17 @@ class Physics{
 		for (var k = 0; k < resultEdge.length; k++) {
 			var edgePoint = resultEdge[k];
 
+			// only the first matching pair per edge point
+			findPair:
 			for (var i = 0; i < bodyA.points.length; i++) {
 				for (var j = 0; j < bodyB.points.length; j++) {
-					
+
 					var diff = sub(bodyA.points[i], bodyB.points[j]);
 
 					if (equalTolerance(edgePoint, diff, 1.0)) {
 						resultA.push(bodyA.points[i]);
 						resultB.push(bodyB.points[j]);
-						break;
+						break findPair;
 					}
 				}
 			}
